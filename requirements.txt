@@ -1,1 +1,8 @@
-duckdb pandas pyarrow matplotlib seaborn
+duckdb
+pandas
+pyarrow
+matplotlib
+seaborn
+scipy
+statsmodels
+ipython
