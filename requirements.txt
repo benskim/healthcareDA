@@ -1,0 +1,1 @@
+duckdb pandas pyarrow matplotlib seaborn
