@@ -39,6 +39,23 @@ plt.rcParams.update({
 })
 pd.set_option("display.max_columns", 100)
 
+# The first notebook output fixes the analysis definition before any data work.
+analysis_definition = pd.DataFrame({
+    "execution_order": [1, 2, 3, 4, 5],
+    "checkpoint": [
+        "ATC2 analysis source", "Matrix A axes", "Matrix A bubble", "Matrix B axes", "Decline warning",
+    ],
+    "definition": [
+        "atc3_region_facil → atcStep2Cd aggregation",
+        "Growth Amount × CAGR",
+        "2022 Market Size",
+        "CAGR × Structural Annual Growth",
+        "Independent of Matrix A segment; structural growth + t-stat only",
+    ],
+})
+print("Fixed analysis definition — verify before execution")
+display(analysis_definition)
+
 
 def robust_zscore(values: pd.Series) -> pd.Series:
     """Return median/MAD z-scores; use standard deviation only when MAD is zero."""
@@ -121,9 +138,17 @@ monthly_atc2["date"] = pd.to_datetime(monthly_atc2[["year", "month"]].assign(day
 monthly_atc2["market_amt"] = monthly_atc2["market_amt"].astype(float)
 monthly_atc2["market_amt_억원"] = monthly_atc2["market_amt"] / 1e8
 monthly_atc2["log_market_amt"] = np.where(monthly_atc2["market_amt"] > 0, np.log(monthly_atc2["market_amt"]), np.nan)
+# Preserve every observed ATC2 even if its three-character master lookup is absent.
+# The fallback label is the code itself; the flag keeps the lookup-coverage QA visible.
+monthly_atc2["group_name_missing_from_master"] = monthly_atc2["group_name"].isna()
+monthly_atc2["group_name"] = monthly_atc2["group_name"].fillna(monthly_atc2["group_id"])
 monthly_atc2 = monthly_atc2.sort_values(["group_id", "date"]).reset_index(drop=True)
+atc2_month_qa = (monthly_atc2.groupby("group_id", as_index=False)
+                 .agg(month_observations=("date", "nunique"), missing_market_amounts=("market_amt", lambda values: values.isna().sum())))
 print("STEP 03 — monthly ATC2 market panel")
 display(monthly_atc2.head())
+print("ATC2 monthly observation QA")
+display(atc2_month_qa.agg({"month_observations": ["min", "max"], "missing_market_amounts": "sum"}))
 
 
 # %% STEP 04. Structural Trend
@@ -137,7 +162,9 @@ def fit_structural_trend(group: pd.DataFrame) -> pd.Series:
             "trend_r2", "trend_tstat", "trend_pvalue", "robust_residual_outlier_count",
             "robust_residual_outlier_rate",
         )})
-    data["time"] = np.arange(len(data))
+    # Use actual calendar-month distance rather than row number so a source-data
+    # gap cannot be silently treated as if it were a consecutive month.
+    data["time"] = (data["date"].dt.year - START_YEAR) * 12 + (data["date"].dt.month - 1)
     data["weight"] = RECENCY_DECAY ** (data["time"].max() - data["time"])
     month_dummies = pd.get_dummies(data["month"].astype(str), prefix="month", drop_first=True, dtype=float)
     exog = sm.add_constant(pd.concat([data[["time"]], month_dummies], axis=1), has_constant="add")
@@ -195,7 +222,18 @@ diagnostic_atc2["endpoint_distortion_flag"] = (
 
 
 # %% STEP 07. Rolling YoY / Momentum
-monthly_atc2["yoy_growth"] = monthly_atc2.groupby("group_id")["market_amt"].pct_change(periods=12)
+# Join to the same calendar month one year earlier. This is deliberately not
+# `pct_change(periods=12)`: if a group has a missing source month, row position
+# must not turn an 11- or 13-month change into a purported YoY observation.
+prior_year_market = monthly_atc2[["group_id", "date", "market_amt"]].copy()
+prior_year_market["date"] = prior_year_market["date"] + pd.DateOffset(years=1)
+prior_year_market = prior_year_market.rename(columns={"market_amt": "market_amt_prior_year"})
+monthly_atc2 = monthly_atc2.merge(prior_year_market, on=["group_id", "date"], how="left")
+monthly_atc2["yoy_growth"] = np.where(
+    monthly_atc2["market_amt_prior_year"] > 0,
+    monthly_atc2["market_amt"] / monthly_atc2["market_amt_prior_year"] - 1,
+    np.nan,
+)
 monthly_atc2["yoy_growth_pct"] = monthly_atc2["yoy_growth"] * 100
 
 def calc_yoy_momentum(group: pd.DataFrame) -> pd.Series:
@@ -343,8 +381,13 @@ plt.title("Figure 7 — Momentum × Structural Growth"); plt.xlabel("Recent YoY 
 # %% STEP 15. Final QA
 final_qa = pd.DataFrame([{
     "ATC2 group count": diagnostic_atc2["group_id"].nunique(),
+    "ATC2 source/panel counts agree": diagnostic_atc2["group_id"].nunique() == int(source_qa.loc[0, "analysis_distinct_atc2"]),
     "36 months": monthly_atc2["date"].nunique() == ANALYSIS_MONTHS,
+    "ATC2 monthly observations min": atc2_month_qa["month_observations"].min(),
+    "ATC2 monthly observations max": atc2_month_qa["month_observations"].max(),
+    "all ATC2 have 36 months": atc2_month_qa["month_observations"].eq(ANALYSIS_MONTHS).all(),
     "missing group_name count": diagnostic_atc2["group_name"].isna().sum(),
+    "missing group_name from master count": monthly_atc2.loc[monthly_atc2["group_name_missing_from_master"], "group_id"].nunique(),
     "missing market amount count": monthly_atc2["market_amt"].isna().sum(),
     "missing trend result count": diagnostic_atc2["normalized_annual_growth"].isna().sum(),
     "missing CAGR count": diagnostic_atc2["cagr"].isna().sum(),
@@ -356,5 +399,6 @@ final_qa = pd.DataFrame([{
 print("STEP 15 — final QA")
 display(final_qa)
 assert bool(final_qa.loc[0, "36 months"])
+assert bool(final_qa.loc[0, "ATC2 source/panel counts agree"])
 assert bool(final_qa.loc[0, "segment sum equals ATC2 count"])
 assert bool(final_qa.loc[0, "declining groups have segments"])
