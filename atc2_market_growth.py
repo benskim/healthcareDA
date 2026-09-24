@@ -3,8 +3,9 @@
 #
 # This replaces the legacy MEFI pipeline rather than renaming its grouping key.
 # Key design changes: the source is `atc3_region_facil` grouped by categorical
-# `atcStep2Cd`; Matrix A is Growth Amount × CAGR with 2022 market-size bubbles;
-# Matrix B separately validates endpoint CAGR against structural WLS growth; and
+# `atcStep2Cd`; Matrix A is 2022 Market Size × Structural Growth with absolute
+# Growth Amount bubbles;
+# Matrix B separately validates endpoint CGR against structural WLS growth; and
 # structural decline remains an independent, statistically significant warning.
 
 # %% STEP 00. Imports / Parameters
@@ -32,6 +33,7 @@ GAP_Z_THRESHOLD = 3
 DECLINE_TSTAT_THRESHOLD = 2
 RECENT_YOY_MONTHS = 12
 TOP_N_GROUPS = 12
+ANALYSIS_INSUP_TYPES = (4, 5, 7)
 
 plt.rcParams.update({
     "figure.figsize": (13, 7), "axes.grid": True,
@@ -47,9 +49,9 @@ analysis_definition = pd.DataFrame({
     ],
     "definition": [
         "atc3_region_facil → atcStep2Cd aggregation",
-        "Growth Amount × CAGR",
-        "2022 Market Size",
-        "CAGR × Structural Annual Growth",
+        "2022 Market Size × Structural Growth",
+        "|Growth Amount| (sign shown separately)",
+        "CGR × Structural Annual Growth",
         "Independent of Matrix A segment; structural growth + t-stat only",
     ],
 })
@@ -76,9 +78,12 @@ def add_name_label(frame: pd.DataFrame) -> pd.Series:
 # %% STEP 01. Source QA
 con = duckdb.connect(str(DATABASE_PATH), read_only=True)
 source_qa = con.execute(f"""
-    WITH filtered AS (
+    WITH period_filtered AS (
         SELECT * FROM {SOURCE_TABLE}
         WHERE CAST(diagYm AS INTEGER) BETWEEN {START_DIAG_YM} AND {END_DIAG_YM}
+    ), filtered AS (
+        SELECT * FROM period_filtered
+        WHERE CAST(insupTpCd AS INTEGER) IN (4, 5, 7)
     ), monthly_observations AS (
         SELECT atcStep2Cd, COUNT(DISTINCT diagYm) AS month_observations
         FROM filtered GROUP BY atcStep2Cd
@@ -88,7 +93,8 @@ source_qa = con.execute(f"""
         (SELECT MAX(CAST(diagYm AS INTEGER)) FROM {SOURCE_TABLE}) AS source_max_diag_ym,
         (SELECT COUNT(DISTINCT diagYm) FROM filtered) AS analysis_distinct_months,
         (SELECT COUNT(DISTINCT atcStep2Cd) FROM filtered) AS analysis_distinct_atc2,
-        (SELECT LIST(DISTINCT insupTpCd ORDER BY insupTpCd) FROM filtered) AS insup_tp_values,
+        (SELECT LIST(DISTINCT insupTpCd ORDER BY insupTpCd) FROM period_filtered) AS source_insup_tp_values,
+        (SELECT LIST(DISTINCT insupTpCd ORDER BY insupTpCd) FROM filtered) AS analysis_insup_tp_values,
         (SELECT LIST(DISTINCT medInstType ORDER BY medInstType) FROM filtered) AS med_inst_type_values,
         (SELECT MIN(month_observations) FROM monthly_observations) AS atc2_month_observations_min,
         (SELECT MAX(month_observations) FROM monthly_observations) AS atc2_month_observations_max
@@ -127,6 +133,7 @@ monthly_atc2 = con.execute(f"""
             SUM(msupUseAmt) AS market_amt
         FROM {SOURCE_TABLE}
         WHERE CAST(diagYm AS INTEGER) BETWEEN {START_DIAG_YM} AND {END_DIAG_YM}
+          AND CAST(insupTpCd AS INTEGER) IN (4, 5, 7)
         GROUP BY 1, 2, 3
     )
     SELECT monthly.group_id, master.group_name, monthly.year, monthly.month, monthly.market_amt
@@ -196,28 +203,40 @@ display(trend_atc2.head())
 annual_market = monthly_atc2.groupby(["group_id", "group_name", "year"], dropna=False, as_index=False)["market_amt"].sum()
 growth_atc2 = annual_market.pivot(index=["group_id", "group_name"], columns="year", values="market_amt").reset_index()
 growth_atc2.columns.name = None
-for year in (START_YEAR, END_YEAR):
+for year in (START_YEAR, 2021, END_YEAR):
     if year not in growth_atc2:
         growth_atc2[year] = np.nan
-growth_atc2 = growth_atc2.rename(columns={START_YEAR: "market_2020", END_YEAR: "market_2022"})
+growth_atc2 = growth_atc2.rename(columns={START_YEAR: "market_2020", 2021: "market_2021", END_YEAR: "market_2022"})
+growth_atc2["market_size_2022"] = growth_atc2["market_2022"]
 growth_atc2["market_2022_억원"] = growth_atc2["market_2022"] / 1e8
+growth_atc2["market_size_2022_억원"] = growth_atc2["market_size_2022"] / 1e8
 growth_atc2["growth_amount"] = growth_atc2["market_2022"] - growth_atc2["market_2020"]
 growth_atc2["growth_amount_억원"] = growth_atc2["growth_amount"] / 1e8
-growth_atc2["cagr"] = np.where(
+growth_atc2["cgr"] = np.where(
     (growth_atc2["market_2020"] > 0) & (growth_atc2["market_2022"] >= 0),
-    (growth_atc2["market_2022"] / growth_atc2["market_2020"]) ** (1 / 2) - 1, np.nan,
+    growth_atc2["market_2022"] / growth_atc2["market_2020"] - 1, np.nan,
 )
-growth_atc2["cagr_pct"] = growth_atc2["cagr"] * 100
+growth_atc2["cgr_pct"] = growth_atc2["cgr"] * 100
 
 
-# %% STEP 06. CAGR vs Structural Gap
+# %% STEP 06. CGR vs Structural Gap
 diagnostic_atc2 = growth_atc2.merge(trend_atc2, on=["group_id", "group_name"], how="left")
-diagnostic_atc2["cagr_trend_gap"] = diagnostic_atc2["cagr"] - diagnostic_atc2["normalized_annual_growth"]
-diagnostic_atc2["cagr_trend_gap_pp"] = diagnostic_atc2["cagr_trend_gap"] * 100
-diagnostic_atc2["gap_robust_z"] = robust_zscore(diagnostic_atc2["cagr_trend_gap_pp"])
+diagnostic_atc2["cgr_trend_gap"] = diagnostic_atc2["cgr"] - diagnostic_atc2["normalized_annual_growth"]
+diagnostic_atc2["cgr_trend_gap_pp"] = diagnostic_atc2["cgr_trend_gap"] * 100
+diagnostic_atc2["gap_robust_z"] = robust_zscore(diagnostic_atc2["cgr_trend_gap_pp"])
 diagnostic_atc2["endpoint_distortion_flag"] = (
-    diagnostic_atc2["cagr_trend_gap_pp"].abs().ge(GAP_THRESHOLD_PP)
+    diagnostic_atc2["cgr_trend_gap_pp"].abs().ge(GAP_THRESHOLD_PP)
     | diagnostic_atc2["gap_robust_z"].abs().ge(GAP_Z_THRESHOLD)
+)
+diagnostic_atc2["growth_diagnostic"] = np.select(
+    [
+        diagnostic_atc2["cgr"].ge(0) & diagnostic_atc2["normalized_annual_growth"].ge(0),
+        diagnostic_atc2["cgr"].ge(0) & diagnostic_atc2["normalized_annual_growth"].lt(0),
+        diagnostic_atc2["cgr"].lt(0) & diagnostic_atc2["normalized_annual_growth"].ge(0),
+        diagnostic_atc2["cgr"].lt(0) & diagnostic_atc2["normalized_annual_growth"].lt(0),
+    ],
+    ["A: CGR+ / Structural+", "B: CGR+ / Structural-", "C: CGR- / Structural+", "D: CGR- / Structural-"],
+    default="Unclassified",
 )
 
 
@@ -238,7 +257,11 @@ monthly_atc2["yoy_growth_pct"] = monthly_atc2["yoy_growth"] * 100
 
 def calc_yoy_momentum(group: pd.DataFrame) -> pd.Series:
     data = group.dropna(subset=["yoy_growth"]).sort_values("date").copy()
-    result = {"mean_yoy_growth": data["yoy_growth"].mean(), "yoy_growth_sd": data["yoy_growth"].std()}
+    result = {
+        "mean_yoy_growth": data["yoy_growth"].mean(),
+        "yoy_growth_sd": data["yoy_growth"].std(),
+        "growth_persistence": (data["yoy_growth"] > 0).mean(),
+    }
     if len(data) < RECENT_YOY_MONTHS:
         return pd.Series(result | {key: np.nan for key in (
             "yoy_beta_recent", "yoy_beta_recent_tstat", "yoy_beta_recent_pvalue",
@@ -283,14 +306,19 @@ diagnostic_atc2.loc[declining_index, "decline_severity_rank"] = (
 
 
 # %% STEP 09. Matrix A
-# Medians provide relative positioning within the limited ATC2 universe, avoiding arbitrary absolute thresholds.
-growth_amount_median = diagnostic_atc2["growth_amount"].median()
-cagr_median = diagnostic_atc2["cagr"].median()
+# Relative positions use robust z-scores: log(2022 market size) for the size
+# dimension and monthly structural beta for the trend dimension.
+diagnostic_atc2["log_market_size_2022"] = np.where(
+    diagnostic_atc2["market_size_2022"] > 0, np.log(diagnostic_atc2["market_size_2022"]), np.nan
+)
+diagnostic_atc2["market_size_z"] = robust_zscore(diagnostic_atc2["log_market_size_2022"])
+diagnostic_atc2["structural_growth_z"] = robust_zscore(diagnostic_atc2["trend_beta_monthly"])
+diagnostic_atc2["growth_amount_abs_억원"] = diagnostic_atc2["growth_amount_억원"].abs()
 def classify_segment(row: pd.Series) -> str | float:
-    if pd.isna(row["growth_amount"]) or pd.isna(row["cagr"]): return np.nan
-    if row["growth_amount"] >= growth_amount_median and row["cagr"] >= cagr_median: return "Star"
-    if row["growth_amount"] >= growth_amount_median: return "Cash Cow"
-    if row["cagr"] >= cagr_median: return "Rising"
+    if pd.isna(row["market_size_z"]) or pd.isna(row["structural_growth_z"]): return np.nan
+    if row["market_size_z"] >= 0 and row["structural_growth_z"] >= 0: return "Star"
+    if row["market_size_z"] >= 0: return "Cash Cow"
+    if row["structural_growth_z"] >= 0: return "Rising"
     return "Laggard"
 diagnostic_atc2["segment"] = diagnostic_atc2.apply(classify_segment, axis=1)
 
@@ -300,12 +328,12 @@ diagnostic_atc2["segment"] = diagnostic_atc2.apply(classify_segment, axis=1)
 
 # %% STEP 11. Diagnostic Table
 DIAGNOSTIC_COLUMNS = [
-    "group_id", "group_name", "market_2020", "market_2022", "market_2022_억원", "growth_amount", "growth_amount_억원",
-    "cagr", "cagr_pct", "trend_beta_monthly", "normalized_annual_growth", "normalized_annual_growth_pct", "trend_r2", "trend_tstat", "trend_pvalue",
-    "robust_residual_outlier_count", "robust_residual_outlier_rate", "cagr_trend_gap", "cagr_trend_gap_pp", "gap_robust_z", "endpoint_distortion_flag",
-    "mean_yoy_growth", "yoy_growth_sd", "yoy_beta_recent", "yoy_beta_recent_tstat", "yoy_beta_recent_pvalue",
+    "group_id", "group_name", "market_2020", "market_2021", "market_2022", "market_size_2022", "market_size_2022_억원", "growth_amount", "growth_amount_억원", "growth_amount_abs_억원",
+    "cgr", "cgr_pct", "trend_beta_monthly", "normalized_annual_growth", "normalized_annual_growth_pct", "trend_r2", "trend_tstat", "trend_pvalue",
+    "robust_residual_outlier_count", "robust_residual_outlier_rate", "cgr_trend_gap", "cgr_trend_gap_pp", "gap_robust_z", "endpoint_distortion_flag", "growth_diagnostic",
+    "mean_yoy_growth", "yoy_growth_sd", "growth_persistence", "yoy_beta_recent", "yoy_beta_recent_tstat", "yoy_beta_recent_pvalue",
     "early_yoy_beta", "late_yoy_beta", "yoy_beta_change", "yoy_beta_change_tstat", "yoy_beta_change_pvalue",
-    "is_declining", "decline_severity_rank", "segment",
+    "is_declining", "decline_severity_rank", "market_size_z", "structural_growth_z", "segment",
 ]
 diagnostic_atc2 = diagnostic_atc2[DIAGNOSTIC_COLUMNS].sort_values(["segment", "growth_amount"], ascending=[True, False], na_position="last").reset_index(drop=True)
 print("STEP 11 — complete diagnostic table")
@@ -319,8 +347,8 @@ anomaly_groups = {
     # Low reliability is reported transparently using the existing t-stat and endpoint-distortion criteria.
     "Rising + Low Reliability": diagnostic_atc2.query("segment == 'Rising' and (abs(trend_tstat) < @DECLINE_TSTAT_THRESHOLD or endpoint_distortion_flag)"),
     "Laggard + Recovery": diagnostic_atc2.query("segment == 'Laggard' and yoy_beta_recent > 0"),
-    "Endpoint/Structural divergence": diagnostic_atc2.query("abs(cagr_trend_gap_pp) >= @GAP_THRESHOLD_PP or abs(gap_robust_z) >= @GAP_Z_THRESHOLD"),
-    "Negative Growth Amount + CAGR": diagnostic_atc2.query("growth_amount < 0 and cagr < 0"),
+    "Endpoint/Structural divergence": diagnostic_atc2.query("abs(cgr_trend_gap_pp) >= @GAP_THRESHOLD_PP or abs(gap_robust_z) >= @GAP_Z_THRESHOLD"),
+    "Negative Growth Amount + CGR": diagnostic_atc2.query("growth_amount < 0 and cgr < 0"),
 }
 for title, frame in anomaly_groups.items():
     print(f"STEP 12 — {title}: {len(frame)} groups")
@@ -330,7 +358,7 @@ for title, frame in anomaly_groups.items():
 # %% STEP 13. Segment Summary
 segment_summary = (diagnostic_atc2.dropna(subset=["segment"]).groupby("segment", as_index=False)
                    .agg(group_count=("group_id", "size"), total_2022_market=("market_2022", "sum"),
-                        total_growth_amount=("growth_amount", "sum"), median_cagr=("cagr", "median"),
+                        total_growth_amount=("growth_amount", "sum"), median_cgr=("cgr", "median"),
                         median_structural_growth=("normalized_annual_growth", "median"), declining_count=("is_declining", "sum")))
 segment_summary["group_share"] = segment_summary["group_count"] / segment_summary["group_count"].sum()
 segment_summary["declining_share"] = segment_summary["declining_count"] / segment_summary["group_count"]
@@ -346,36 +374,55 @@ plt.title("Figure 1 — ATC2 Total Monthly Market Size"); plt.xlabel("Month"); p
 # Figure 2
 plt.figure(); plt.hist(diagnostic_atc2["normalized_annual_growth_pct"].dropna(), bins=20, edgecolor="white")
 plt.title("Figure 2 — Structural Annual Growth Distribution"); plt.xlabel("Normalized Annual Growth (%)"); plt.ylabel("ATC2 count"); plt.tight_layout(); plt.show()
-# Figure 3: Matrix A — never log-scale growth amount because negative values are meaningful.
+# Figure 3: Matrix A. X is 2022 market size, Y is structural growth, and bubble
+# area is |growth amount|. Triangle direction retains the growth-amount sign.
 colors = {"Star": "#2E86AB", "Cash Cow": "#F6AE2D", "Rising": "#3DA35D", "Laggard": "#9B59B6"}
 fig, ax = plt.subplots()
 for segment, frame in diagnostic_atc2.groupby("segment", dropna=True):
-    ax.scatter(frame["growth_amount_억원"], frame["cagr_pct"], s=np.sqrt(frame["market_2022_억원"].clip(lower=0)) * 30 + 30,
-               c=colors[segment], alpha=.7, label=segment, edgecolors="white")
+    for is_positive, marker in ((True, "^"), (False, "v")):
+        points = frame[frame["growth_amount"].ge(0) == is_positive]
+        ax.scatter(points["market_size_2022_억원"], points["normalized_annual_growth_pct"],
+                   s=np.sqrt(points["growth_amount_abs_억원"].fillna(0)) * 30 + 30, marker=marker,
+                   c=colors[segment], alpha=.7, label=segment if is_positive else None, edgecolors="white")
 decline = diagnostic_atc2[diagnostic_atc2["is_declining"]]
-ax.scatter(decline["growth_amount_억원"], decline["cagr_pct"], s=np.sqrt(decline["market_2022_억원"].clip(lower=0)) * 30 + 45,
+ax.scatter(decline["market_size_2022_억원"], decline["normalized_annual_growth_pct"], s=np.sqrt(decline["growth_amount_abs_억원"].fillna(0)) * 30 + 45,
            facecolors="none", edgecolors="black", linewidths=1.8, label="Structural decline")
-for (_, row), label in zip(diagnostic_atc2.iterrows(), plot_names): ax.annotate(label, (row["growth_amount_억원"], row["cagr_pct"]), fontsize=7, xytext=(3, 3), textcoords="offset points")
-ax.axvline(growth_amount_median / 1e8, color="grey", linestyle="--"); ax.axhline(cagr_median * 100, color="grey", linestyle="--")
-ax.set(title="Figure 3 — Matrix A: Growth Amount × CAGR", xlabel="Growth Amount (억원)", ylabel="CAGR (%)"); ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left"); plt.tight_layout(); plt.show()
+for (_, row), label in zip(diagnostic_atc2.iterrows(), plot_names): ax.annotate(label, (row["market_size_2022_억원"], row["normalized_annual_growth_pct"]), fontsize=7, xytext=(3, 3), textcoords="offset points")
+ax.axvline(diagnostic_atc2["market_size_2022_억원"].median(), color="grey", linestyle="--"); ax.axhline(diagnostic_atc2["normalized_annual_growth_pct"].median(), color="grey", linestyle="--")
+ax.set_xscale("log")
+ax.set(title="Figure 3 — Matrix A: Market Size × Structural Growth", xlabel="2022 Market Size (억원, log scale)", ylabel="Structural Annual Growth (%)"); ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left"); plt.tight_layout(); plt.show()
 # Figure 4: Matrix B
-fig, ax = plt.subplots(); ax.scatter(diagnostic_atc2["cagr_pct"], diagnostic_atc2["normalized_annual_growth_pct"], alpha=.7)
-limits = np.array([diagnostic_atc2[["cagr_pct", "normalized_annual_growth_pct"]].min().min(), diagnostic_atc2[["cagr_pct", "normalized_annual_growth_pct"]].max().max()])
+fig, ax = plt.subplots(); ax.scatter(diagnostic_atc2["cgr_pct"], diagnostic_atc2["normalized_annual_growth_pct"], alpha=.7)
+limits = np.array([diagnostic_atc2[["cgr_pct", "normalized_annual_growth_pct"]].min().min(), diagnostic_atc2[["cgr_pct", "normalized_annual_growth_pct"]].max().max()])
 ax.plot(limits, limits, "k--", label="Y = X")
-flag = diagnostic_atc2[diagnostic_atc2["endpoint_distortion_flag"]]; ax.scatter(flag["cagr_pct"], flag["normalized_annual_growth_pct"], facecolors="none", edgecolors="red", s=100, label="Endpoint distortion")
-for (_, row), label in zip(diagnostic_atc2.iterrows(), plot_names): ax.annotate(label, (row["cagr_pct"], row["normalized_annual_growth_pct"]), fontsize=7, xytext=(3, 3), textcoords="offset points")
-ax.set(title="Figure 4 — Matrix B: CAGR × Structural Annual Growth", xlabel="CAGR (%)", ylabel="Structural Annual Growth (%)"); ax.legend(); plt.tight_layout(); plt.show()
-# Figure 5
-plt.figure(); plt.hist(diagnostic_atc2["cagr_trend_gap_pp"].dropna(), bins=20, edgecolor="white"); plt.axvline(0, color="black", linestyle="--")
-plt.title("Figure 5 — CAGR − Structural Growth Gap"); plt.xlabel("Percentage points"); plt.ylabel("ATC2 count"); plt.tight_layout(); plt.show()
+flag = diagnostic_atc2[diagnostic_atc2["endpoint_distortion_flag"]]; ax.scatter(flag["cgr_pct"], flag["normalized_annual_growth_pct"], facecolors="none", edgecolors="red", s=100, label="Endpoint distortion")
+for (_, row), label in zip(diagnostic_atc2.iterrows(), plot_names): ax.annotate(label, (row["cgr_pct"], row["normalized_annual_growth_pct"]), fontsize=7, xytext=(3, 3), textcoords="offset points")
+ax.set(title="Figure 4 — Matrix B: CGR × Structural Annual Growth", xlabel="CGR (%)", ylabel="Structural Annual Growth (%)"); ax.legend(); plt.tight_layout(); plt.show()
+# Figure 5: inspect the monthly paths for the ATC2s that require follow-up.
+flagged_group_ids = diagnostic_atc2.loc[
+    diagnostic_atc2["is_declining"] | diagnostic_atc2["endpoint_distortion_flag"], "group_id"
+].head(TOP_N_GROUPS)
+flagged_monthly = monthly_atc2[monthly_atc2["group_id"].isin(flagged_group_ids)]
+if flagged_monthly.empty:
+    print("Figure 5 — no declining or endpoint-distortion ATC2 groups to plot.")
+else:
+    plt.figure(figsize=(14, 7))
+    for group_id, frame in flagged_monthly.groupby("group_id"):
+        plt.plot(frame["date"], frame["market_amt_억원"], label=add_name_label(frame).iloc[0])
+    plt.title("Figure 5 — Flagged ATC2 Monthly Market Paths")
+    plt.xlabel("Month"); plt.ylabel("Monthly Usage Amount (억원)")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8); plt.tight_layout(); plt.show()
 # Figure 6
+plt.figure(); plt.hist(diagnostic_atc2["cgr_trend_gap_pp"].dropna(), bins=20, edgecolor="white"); plt.axvline(0, color="black", linestyle="--")
+plt.title("Figure 6 — CGR − Structural Growth Gap"); plt.xlabel("Percentage points"); plt.ylabel("ATC2 count"); plt.tight_layout(); plt.show()
+# Figure 7
 momentum_rank = diagnostic_atc2.dropna(subset=["yoy_beta_recent"]).sort_values("yoy_beta_recent")
 plot_momentum = pd.concat([momentum_rank.head(TOP_N_GROUPS), momentum_rank.tail(TOP_N_GROUPS)]).drop_duplicates("group_id")
 plt.figure(figsize=(13, 8)); plt.barh(add_name_label(plot_momentum), plot_momentum["yoy_beta_recent"] * 100)
-plt.title("Figure 6 — Recent YoY Momentum: Bottom / Top Groups"); plt.xlabel("YoY slope (percentage points per month)"); plt.tight_layout(); plt.show()
-# Figure 7
+plt.title("Figure 7 — Recent YoY Momentum: Bottom / Top Groups"); plt.xlabel("YoY slope (percentage points per month)"); plt.tight_layout(); plt.show()
+# Figure 8
 plt.figure(); plt.scatter(diagnostic_atc2["yoy_beta_recent"] * 100, diagnostic_atc2["normalized_annual_growth_pct"], alpha=.7)
-plt.title("Figure 7 — Momentum × Structural Growth"); plt.xlabel("Recent YoY slope (percentage points per month)"); plt.ylabel("Structural Annual Growth (%)"); plt.tight_layout(); plt.show()
+plt.title("Figure 8 — Momentum × Structural Growth"); plt.xlabel("Recent YoY slope (percentage points per month)"); plt.ylabel("Structural Annual Growth (%)"); plt.tight_layout(); plt.show()
 
 
 # %% STEP 15. Final QA
@@ -390,7 +437,7 @@ final_qa = pd.DataFrame([{
     "missing group_name from master count": monthly_atc2.loc[monthly_atc2["group_name_missing_from_master"], "group_id"].nunique(),
     "missing market amount count": monthly_atc2["market_amt"].isna().sum(),
     "missing trend result count": diagnostic_atc2["normalized_annual_growth"].isna().sum(),
-    "missing CAGR count": diagnostic_atc2["cagr"].isna().sum(),
+    "missing CGR count": diagnostic_atc2["cgr"].isna().sum(),
     "declining group count": diagnostic_atc2["is_declining"].sum(),
     "segment group count": diagnostic_atc2["segment"].notna().sum(),
     "segment sum equals ATC2 count": diagnostic_atc2["segment"].notna().sum() == diagnostic_atc2["group_id"].nunique(),
