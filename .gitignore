@@ -1,4 +1,6 @@
 *.csv
 *.tsv
+*.xlsx
+*.png
 *.parquet
-*.json
+*.duckdb.*
