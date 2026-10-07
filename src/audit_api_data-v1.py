@@ -42,7 +42,7 @@ TIER_B = (0.90, 0.05)
 
 
 def load_api(api_dir: Path):
-    files = sorted(api_dir.glob("data_*.pq"))
+    files = sorted(api_dir.glob("sick/data_*.pq"))
     if not files:
         raise SystemExit(f"{api_dir} 에 data_*.pq 가 없습니다.")
     parts, insup, dx_len, req = [], Counter(), Counter(), Counter()
