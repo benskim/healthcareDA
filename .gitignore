@@ -3,4 +3,5 @@
 *.xlsx
 *.png
 *.parquet
+*.pq
 *.duckdb.*

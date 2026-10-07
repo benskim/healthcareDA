@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 # 설정
 # ============================================================
 
-RAW_DIR = Path("raw_data")
+RAW_DIR = Path("/workspaces/healthcareDA/old/raw_data")
 OUTPUT_DIR = Path("parquet")
 
 CHUNK_SIZE = 200_000
